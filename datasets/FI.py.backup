@@ -1,0 +1,267 @@
+import os
+import random
+import pickle
+import numpy as np
+from collections import defaultdict
+from pathlib import Path
+from dassl.data.datasets import DATASET_REGISTRY, DatasetBase
+from dassl.utils import listdir_nohidden, mkdir_if_missing
+
+# FI数据集的8个情绪类别 (与EmoSet相同)
+FI_EMOTIONS = ["Amusement", "Anger", "Awe", "Contentment", "Disgust", "Excitement", "Fear", "Sadness"]
+# 建立情绪名称到整数标签的映射
+CLASSNAME_TO_LABEL = {name: i for i, name in enumerate(FI_EMOTIONS)}
+LABEL_TO_CLASSNAME = {i: name for i, name in enumerate(FI_EMOTIONS)}
+NUM_CLASSES = len(FI_EMOTIONS)
+
+
+class Datum:
+    def __init__(self, impath, label, domain, classname):
+        self._impath = impath
+        self._label = int(label)
+        self._domain = int(domain)
+        self._classname = str(classname)
+
+    @property
+    def impath(self):
+        return self._impath
+
+    @property
+    def label(self):
+        return self._label
+
+    @property
+    def domain(self):
+        return self._domain
+
+    @property
+    def classname(self):
+        return self._classname
+    
+    
+@DATASET_REGISTRY.register()
+class FI(DatasetBase):
+    dataset_dir = ""  # 数据集文件夹名称
+    domains = []
+
+    def __init__(self, cfg):
+        root = os.path.abspath(os.path.expanduser(cfg.DATASET.ROOT))
+        self.dataset_dir = root
+
+        # 创建用于保存few-shot数据的目录
+        self.split_fewshot_dir = os.path.join(self.dataset_dir, "split_fewshot")
+        mkdir_if_missing(self.split_fewshot_dir)
+
+        # 创建backup目录用于保存每次随机划分的结果
+        self.backup_dir = os.path.join(self.dataset_dir, "backup")
+        mkdir_if_missing(self.backup_dir)
+
+        # 不使用固定随机种子，每次都是随机划分
+        print("Using random split without fixed seed (different each time)")
+
+        # 验证必要目录是否存在
+        self._validate_dataset_structure()
+
+        # 读取所有数据
+        all_items = self._read_data_from_directories()
+
+        # 进行80:5:15随机划分 (train:val:test)
+        train_items, val_items, test_items = self._random_split(
+            all_items,
+            train_ratio=0.8,
+            val_ratio=0.05,
+            test_ratio=0.15
+        )
+
+        # 保存本次划分结果到backup目录
+        self._save_split_to_backup(train_items, val_items, test_items)
+
+        # 处理少样本学习配置
+        num_shots = cfg.DATASET.NUM_SHOTS
+        if num_shots >= 1:
+            seed = cfg.SEED
+            preprocessed = os.path.join(self.split_fewshot_dir, f"shot_{num_shots}-seed_{seed}.pkl")
+
+            if os.path.exists(preprocessed):
+                print(f"Loading preprocessed few-shot data from {preprocessed}")
+                with open(preprocessed, "rb") as file:
+                    data = pickle.load(file)
+                    train_items, val_items = data["train"], data["val"]
+            else:
+                train_items = self._generate_fewshot_dataset(train_items, num_shots=num_shots, seed=seed)
+                val_items = self._generate_fewshot_dataset(test_items, num_shots=min(num_shots, 4), seed=seed)
+                data = {"train": train_items, "val": val_items}
+                print(f"Saving preprocessed few-shot data to {preprocessed}")
+                with open(preprocessed, "wb") as file:
+                    pickle.dump(data, file, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # 处理类别子采样
+        subsample = getattr(cfg.DATASET, 'SUBSAMPLE_CLASSES', 'all')
+        if subsample != 'all':
+            train_items, val_items, test_items = self._subsample_classes(
+                train_items, val_items, test_items, subsample=subsample
+            )
+
+        super().__init__(train_x=train_items, val=val_items, test=test_items)
+
+    def _validate_dataset_structure(self):
+        """验证数据集结构是否正确"""
+        if not os.path.exists(self.dataset_dir):
+            raise FileNotFoundError(f"Dataset directory not found: {self.dataset_dir}")
+        
+        # 检查情绪类别文件夹是否存在
+        missing_emotion_dirs = []
+        for emotion in FI_EMOTIONS:
+            emotion_dir = os.path.join(self.dataset_dir, emotion)
+            if not os.path.exists(emotion_dir):
+                missing_emotion_dirs.append(emotion)
+        
+        if missing_emotion_dirs:
+            raise FileNotFoundError(f"Missing emotion directories: {missing_emotion_dirs}")
+        
+        print(f"Dataset validation passed. Found all {len(FI_EMOTIONS)} emotion directories.")
+
+    def _read_data_from_directories(self):
+        """从各个情感目录中读取图像数据"""
+        all_items = []
+        
+        for emotion in FI_EMOTIONS:
+            emotion_dir = os.path.join(self.dataset_dir, emotion)
+            
+            # 获取该情感目录下的所有图像文件
+            image_files = listdir_nohidden(emotion_dir)
+            image_files = [f for f in image_files if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.tiff'))]
+            
+            print(f"Loading {len(image_files)} images from {emotion} directory")
+            
+            for image_file in image_files:
+                impath = os.path.join(emotion_dir, image_file)
+                
+                # 验证图像文件是否存在
+                if not os.path.exists(impath):
+                    print(f"Warning: Image file not found: {impath}. Skipping.")
+                    continue
+                
+                label = CLASSNAME_TO_LABEL[emotion]
+                domain = 0
+                classname = emotion
+
+                item = Datum(impath=impath, label=label, domain=domain,
+                           classname=classname)
+                all_items.append(item)
+        
+        if not all_items:
+            raise ValueError("No valid data items were loaded from FI dataset.")
+        
+        print(f"Successfully loaded {len(all_items)} items from FI dataset.")
+        return all_items
+
+    def _random_split(self, all_items, train_ratio=0.8, val_ratio=0.05, test_ratio=0.15):
+        """随机划分数据集为训练集、验证集和测试集，不使用固定种子"""
+        print(f"Performing random split with ratio train:{train_ratio}, val:{val_ratio}, test:{test_ratio}")
+        print("Note: No fixed seed, split will be different each time")
+
+        # 不设置随机种子，确保每次都是随机的
+
+        # 按类别分组进行分层划分
+        items_by_class = defaultdict(list)
+        for item in all_items:
+            items_by_class[item.classname].append(item)
+
+        train_items = []
+        val_items = []
+        test_items = []
+
+        for classname, class_items in items_by_class.items():
+            # 随机打乱该类别的样本
+            random.shuffle(class_items)
+
+            # 计算各集合的样本数量
+            num_train = int(len(class_items) * train_ratio)
+            num_val = int(len(class_items) * val_ratio)
+            # test集使用剩余的所有样本
+
+            # 划分训练集、验证集和测试集
+            train_items.extend(class_items[:num_train])
+            val_items.extend(class_items[num_train:num_train + num_val])
+            test_items.extend(class_items[num_train + num_val:])
+
+            print(f"  {classname}: {num_train} train, {num_val} val, {len(class_items)-num_train-num_val} test")
+
+        # 重新随机化整体顺序
+        random.shuffle(train_items)
+        random.shuffle(val_items)
+        random.shuffle(test_items)
+
+        print(f"Random split completed: {len(train_items)} train, {len(val_items)} val, {len(test_items)} test")
+        return train_items, val_items, test_items
+
+    def _save_split_to_backup(self, train_items, val_items, test_items):
+        """保存本次划分结果到backup目录"""
+        import datetime
+
+        # 生成带时间戳的文件名
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_filename = f"split_{timestamp}.pkl"
+        backup_path = os.path.join(self.backup_dir, backup_filename)
+
+        # 保存划分结果
+        split_data = {
+            "train": train_items,
+            "val": val_items,
+            "test": test_items,
+            "timestamp": timestamp,
+            "num_train": len(train_items),
+            "num_val": len(val_items),
+            "num_test": len(test_items)
+        }
+
+        with open(backup_path, "wb") as f:
+            pickle.dump(split_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        print(f"Split saved to backup: {backup_path}")
+        print(f"  Train: {len(train_items)}, Val: {len(val_items)}, Test: {len(test_items)}")
+
+    def _generate_fewshot_dataset(self, items, num_shots, seed):
+        """生成少样本学习数据集"""
+        random.seed(seed)
+        
+        # 按类别分组
+        items_by_class = defaultdict(list)
+        for item in items:
+            items_by_class[item.classname].append(item)
+        
+        fewshot_items = []
+        for classname, class_items in items_by_class.items():
+            if len(class_items) >= num_shots:
+                selected = random.sample(class_items, num_shots)
+            else:
+                selected = class_items
+                print(f"Warning: Class '{classname}' has only {len(class_items)} samples, less than {num_shots} shots.")
+            fewshot_items.extend(selected)
+        
+        print(f"Generated few-shot dataset with {len(fewshot_items)} items ({num_shots} shots per class)")
+        return fewshot_items
+
+    def _subsample_classes(self, train, val, test, subsample):
+        """子采样类别"""
+        if subsample == 'all':
+            return train, val, test
+        
+        if isinstance(subsample, int):
+            selected_classes = FI_EMOTIONS[:subsample]
+        elif isinstance(subsample, list):
+            selected_classes = [cls for cls in subsample if cls in FI_EMOTIONS]
+        else:
+            raise ValueError(f"Invalid subsample parameter: {subsample}")
+        
+        print(f"Subsampling to classes: {selected_classes}")
+        
+        def filter_by_classes(items, classes):
+            return [item for item in items if item.classname in classes]
+        
+        train = filter_by_classes(train, selected_classes)
+        val = filter_by_classes(val, selected_classes)
+        test = filter_by_classes(test, selected_classes)
+        
+        return train, val, test

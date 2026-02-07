@@ -1,0 +1,47 @@
+# 数据文件夹 - 太大不适合git
+data/
+
+# 训练输出和日志
+output/
+outputs/
+models/
+wandb/
+# 大型权重文件
+all_weights/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# 缓存和临时文件
+cache/
+.cache/
+*.tmp
+*.temp
+.pytest_cache/
+wandb
+
+# 大型文本描述文件
+caption/
+# IDE和编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+*.bak
+
+# 大型嵌入文件
+embeddings/
+*.pkl
+*.pickle
+
+# 屏幕截图和临时图片
+屏幕截图*.png
+image-*.png
+image.png
+log
